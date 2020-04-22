@@ -2,7 +2,10 @@ package main
 
 import (
     "bufio"
+    "context"
+    "flag"
     "fmt"
+    "github.com/influxdata/influxdb-client-go"
     "io"
     "log"
     "net/url"
@@ -15,21 +18,28 @@ import (
 
 func main() {
     var (
-        lp *LogProcess
-        r  Reader
-        w  Writer
-        rc = make(chan []byte)
-        wc = make(chan Message)
+        path      string
+        influxDSN string
+        lp        *LogProcess
+        r         Reader
+        w         Writer
+        rc        = make(chan []byte)
+        wc        = make(chan Message)
     )
-    r = NewReadFromFile("./access.log")
-    w = NewWriteToFluxDB("username@password")
+
+    flag.StringVar(&path, "path", "./access.log", "read file path")
+    flag.StringVar(&influxDSN, "influxDSN", "http://127.0.0.1:9999@uEXWsOHK-zWkTCQtU8dnVHBdfmaptZT3QKy7akghDhPZxnCUOG20CEEtuYD1C0_Tw1TSbihwARl8YdtD1Sa03Q==@my-org@my-bucket", "influx data source")
+    flag.Parse()
+
+    r = NewReadFromFile(path)
+    w = NewWriteToFluxDB(influxDSN)
     lp = NewLogProcess(rc, wc, r, w)
 
     go lp.read.Read(lp.rc)
     go lp.Process()
     go lp.write.Write(lp.wc)
 
-    time.Sleep(30 * time.Second)
+    time.Sleep(360000 * time.Second)
 }
 
 // 读取接口
@@ -98,9 +108,35 @@ func NewWriteToFluxDB(influxDBDNS string) *WriteToFluxDB {
 // 写入模块
 func (w *WriteToFluxDB) Write(wc chan Message) {
     var (
-        v Message
+        influxSlices []string
+        err          error
+        p            *influxdb2.Point
+        v            Message
     )
+    influxSlices = strings.Split(w.influxDBDSN, "@")
+
+    // create new client with default option for server url authenticate by token
+    client := influxdb2.NewClient(influxSlices[0], influxSlices[1])
+    defer client.Close()
+    // user blocking write client for writes to desired bucket
+    writeApi := client.WriteApiBlocking(influxSlices[2], influxSlices[3])
+    // create point using fluent style
     for v = range wc {
+        // Tags: Path, Methods,, Scheme, Status
+        // Fields: UpstreamTime, RequestTime, BytesSent
+        p = influxdb2.NewPointWithMeasurement("nginx_logs").
+            AddTag("Path", v.Path).
+            AddTag("Methods", v.Method).
+            AddTag("Scheme", v.Scheme).
+            AddTag("Status", v.Status).
+            AddField("UpstreamTime", v.UpstreamTime).
+            AddField("RequestTime", v.RequestTime).
+            AddField("BytesSent", v.BytesSent).
+            SetTime(v.TimeLocal)
+        if err = writeApi.WritePoint(context.Background(), p); err != nil {
+            panic(err.Error())
+        }
+
         fmt.Println(v) // 获取WriteChan的数据直接打印出来
     }
 }
@@ -124,14 +160,14 @@ func NewLogProcess(rc chan []byte, wc chan Message, read Reader, write Writer) *
 }
 
 type Message struct {
-    TimeLocal    time.Time
-    BytesSent    int
-    Path         string
-    Method       string
-    Scheme       string
-    Status       string
-    UpstreamTime float64
-    RequestTime  float64
+    TimeLocal    time.Time // 发送请求的时间
+    BytesSent    int       // 发送字节数
+    Path         string    // 请求路径
+    Method       string    // 请求方法
+    Scheme       string    // 协议
+    Status       string    // 状态
+    UpstreamTime float64   // 上层处理请求时间，比如说PHP or MySQL处理时间
+    RequestTime  float64   // 响应时间
 }
 
 // 解析模块，解析文件内容
@@ -198,7 +234,7 @@ func (l *LogProcess) Process() {
 
         message.Scheme = result[5]
         message.Status = result[7]
-        
+
         if upstreamTime, err = strconv.ParseFloat(result[12], 64); err != nil {
             log.Printf("upstreamTime ParseFloat fail: %s", err.Error())
             continue
